@@ -74,8 +74,6 @@ def generate_docx(data: dict) -> bytes:
     _add_section_header(doc, "Business Dynamics")
     bd_data = [
         ("Background", data.get("background", "")),
-        ("Major Suppliers", data.get("major_suppliers", "")),
-        ("Major Clients", data.get("major_clients", "")),
     ]
     t = doc.add_table(rows=len(bd_data), cols=2)
     t.style = 'Table Grid'

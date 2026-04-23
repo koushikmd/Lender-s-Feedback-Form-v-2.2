@@ -422,8 +422,6 @@ function renderReview() {
         <span class="source-badge source-appraisal">From Appraisal</span>
       </div>
       ${textareaHtml('Background', 'background', d.background)}
-      ${textareaHtml('Major Suppliers', 'major_suppliers', d.major_suppliers)}
-      ${textareaHtml('Major Clients', 'major_clients', d.major_clients)}
     </div>
     <div class="review-section">
       <div class="review-section-header">
@@ -680,24 +678,95 @@ def open_browser(url, delay=1.2):
         pass
 
 
+def get_log_path():
+    """Write log to the user's Desktop so they can find it easily."""
+    try:
+        desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
+        if not os.path.isdir(desktop):
+            desktop = os.path.expanduser('~')
+        return os.path.join(desktop, 'LenderFeedbackTool_log.txt')
+    except Exception:
+        return os.path.join(tempfile.gettempdir(), 'LenderFeedbackTool_log.txt')
+
+
 def main():
-    port = find_free_port()
-    url = f'http://127.0.0.1:{port}/'
+    log_path = get_log_path()
+    log_fh = None
+    try:
+        log_fh = open(log_path, 'w', encoding='utf-8', buffering=1)
+    except Exception:
+        pass
 
-    print("=" * 60)
-    print("Lender Feedback Form Tool")
-    print("IDLC Finance Limited - Desktop Edition")
-    print("=" * 60)
-    print(f"\nStarting local server at {url}")
-    print("\n(Data never leaves your computer - all processing is local)")
-    print("\nThe tool will open in your default browser in a moment...")
-    print("\nTo stop the tool, close this window.\n")
+    def log(msg):
+        print(msg)
+        if log_fh:
+            try:
+                log_fh.write(msg + '\n')
+                log_fh.flush()
+            except Exception:
+                pass
 
-    # Open browser in a separate thread after the server starts
-    threading.Thread(target=open_browser, args=(url,), daemon=True).start()
+    try:
+        log("=" * 60)
+        log("Lender Feedback Form Tool")
+        log("IDLC Finance Limited - Desktop Edition")
+        log("=" * 60)
+        log(f"Log file: {log_path}")
+        log(f"Python executable: {sys.executable}")
+        log(f"Python version: {sys.version}")
+        log(f"Working dir: {os.getcwd()}")
 
-    # Bind to 127.0.0.1 ONLY (localhost) - never accessible from network
-    app.run(host='127.0.0.1', port=port, debug=False, use_reloader=False)
+        # Test imports are working
+        log("\n[1/4] Checking dependencies...")
+        import pdfplumber
+        log(f"  pdfplumber {pdfplumber.__version__ if hasattr(pdfplumber,'__version__') else 'OK'}")
+        import docx
+        log(f"  python-docx OK")
+        import flask
+        log(f"  flask {flask.__version__}")
+
+        log("\n[2/4] Finding free port...")
+        port = find_free_port()
+        url = f'http://127.0.0.1:{port}/'
+        log(f"  Using port {port}")
+
+        log(f"\n[3/4] Starting local server at {url}")
+        log("  (Data never leaves your computer - all processing is local)")
+        log("  The tool will open in your default browser in a moment...")
+        log("  To stop the tool, close this window.\n")
+
+        # Open browser in a separate thread after the server starts
+        threading.Thread(target=open_browser, args=(url,), daemon=True).start()
+
+        log("[4/4] Server running. Browser opening...")
+        log("=" * 60)
+
+        # Bind to 127.0.0.1 ONLY (localhost) - never accessible from network
+        app.run(host='127.0.0.1', port=port, debug=False, use_reloader=False)
+
+    except Exception as e:
+        import traceback
+        err_text = traceback.format_exc()
+        log("\n" + "!" * 60)
+        log("ERROR: The tool encountered a problem and could not start.")
+        log("!" * 60)
+        log(err_text)
+        log("\nFull error log saved to: " + log_path)
+        log("Please share this log file for troubleshooting.")
+    finally:
+        if log_fh:
+            try: log_fh.close()
+            except Exception: pass
+
+        # Keep window open so user can read any errors
+        try:
+            print("\n" + "=" * 60)
+            print("Press Enter to close this window...")
+            print("=" * 60)
+            input()
+        except Exception:
+            import time
+            time.sleep(60)  # fallback: stay open 60s
 
 
 if __name__ == '__main__':
