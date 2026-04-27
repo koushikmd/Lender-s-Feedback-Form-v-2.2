@@ -183,63 +183,113 @@ class AppraisalExtractor:
         return self._record("major_clients", None, 0.0)
 
     def _extract_liability_tables(self):
-        """Extract LT and ST liability data using pdfplumber TABLE extraction."""
+        """Extract LT and ST liability data using pdfplumber TABLE extraction.
+
+        Handles continuation tables that span pages: a 'Long Term Financing With other FI'
+        table starting on page N may continue on page N+1 with no header row.
+        We track the last seen LT/ST header column mapping and apply it to header-less
+        tables that appear immediately after on later pages.
+        """
         lt_results = []
         st_results = []
+
+        # Track the last seen LT/ST table classification + column mapping
+        # so we can interpret continuation tables that have no header row
+        last_classification = None  # 'lt' or 'st'
+        last_col_map = None  # dict of column indices
+
+        def is_data_row_for_liability(cells, col_map):
+            """Check if a row looks like a real liability data row (not header, not security details)."""
+            if not cells or len(cells) < 4:
+                return False
+            first = cells[0].lower() if cells[0] else ""
+            if first.startswith("security") or first.startswith("concern") or first.startswith("financial"):
+                return False
+            # The cell containing the limit must look like a number
+            col_limit = col_map.get("limit", -1)
+            if 0 <= col_limit < len(cells):
+                if not re.search(r"\d", cells[col_limit] or ""):
+                    return False
+            else:
+                return False
+            return True
 
         with pdfplumber.open(self.pdf_path) as pdf:
             for page in pdf.pages:
                 tables = page.extract_tables()
                 for table in tables:
-                    if not table or len(table) < 2:
+                    if not table or len(table) < 1:
                         continue
-                    header = [str(c or "").replace("\n", " ").strip().lower() for c in table[0]]
+                    header_raw = [str(c or "").replace("\n", " ").strip().lower() for c in table[0]]
 
-                    has_cash_security = any("cash" in h and "security" in h for h in header)
-                    has_cr_summation = any("summation" in h for h in header)
-                    has_fi_col = any("financial" in h or "institution" in h for h in header)
-                    has_facility_col = any("facility" in h for h in header)
-                    has_installment = any("installment" in h for h in header)
+                    has_cr_summation = any("summation" in h for h in header_raw)
+                    has_fi_col = any("financial" in h or "institution" in h for h in header_raw)
+                    has_facility_col = any("facility" in h for h in header_raw)
+                    has_installment = any("installment" in h for h in header_raw)
 
-                    is_st = has_fi_col and has_facility_col and has_cr_summation
-                    is_lt = has_fi_col and has_facility_col and has_installment and not has_cr_summation
+                    is_st_header = has_fi_col and has_facility_col and has_cr_summation
+                    is_lt_header = has_fi_col and has_facility_col and has_installment and not has_cr_summation
 
-                    if not is_lt and not is_st:
+                    classification = None
+                    col_map = None
+
+                    if is_st_header or is_lt_header:
+                        # This is a real header — build column map from it
+                        def find_col(keywords):
+                            for ki, h in enumerate(header_raw):
+                                if any(kw in h for kw in keywords):
+                                    return ki
+                            return -1
+                        col_map = {
+                            "fi": find_col(["financial", "institution"]),
+                            "facility": find_col(["facility"]),
+                            "limit": find_col(["sanction", "limit"]),
+                            "outstanding": find_col(["current", "outstandin"]),
+                            "term": find_col(["term"]),
+                            "emi": find_col(["installment (bdt)", "(bdt)"]),
+                            "recycle": find_col(["recycle"]),
+                        }
+                        classification = "st" if is_st_header else "lt"
+                        data_rows = table[1:]
+                        # Update tracking state for potential continuations later
+                        last_classification = classification
+                        last_col_map = col_map
+                    elif last_classification and last_col_map:
+                        # Header-less table — could this be a continuation of the previous LT/ST table?
+                        # Heuristic: column count must match AND row 0 must look like a real data row
+                        ncols = len(table[0]) if table[0] else 0
+                        # Continuation tables have the same column count as their original header
+                        # The previous header had len(...) columns. The col_map's max index gives a hint.
+                        max_known_col = max([v for v in last_col_map.values() if v >= 0], default=-1)
+                        if ncols >= max_known_col + 1 and is_data_row_for_liability(
+                            [str(c or "").replace("\n", " ").strip() for c in table[0]],
+                            last_col_map
+                        ):
+                            classification = last_classification
+                            col_map = last_col_map
+                            data_rows = table  # all rows are data
+                        else:
+                            continue
+                    else:
                         continue
 
-                    def find_col(keywords):
-                        for ki, h in enumerate(header):
-                            if any(kw in h for kw in keywords):
-                                return ki
-                        return -1
-
-                    col_fi = find_col(["financial", "institution"])
-                    col_facility = find_col(["facility"])
-                    col_limit = find_col(["sanction", "limit"])
-                    col_outstanding = find_col(["current", "outstandin"])
-                    col_term = find_col(["term"])
-                    col_emi = find_col(["installment\n(bdt)", "installment (bdt)", "(bdt)"])
-                    col_recycle = find_col(["recycle"])
-
-                    for row in table[1:]:
+                    # Process data rows
+                    for row in data_rows:
                         if not row or len(row) < 4:
                             continue
                         cells = [str(c or "").replace("\n", " ").strip() for c in row]
 
-                        if cells[0].lower().startswith("security"):
+                        if not is_data_row_for_liability(cells, col_map):
                             continue
 
-                        fi_name = cells[col_fi] if 0 <= col_fi < len(cells) else ""
-                        facility = cells[col_facility] if 0 <= col_facility < len(cells) else ""
-                        limit_val = cells[col_limit] if 0 <= col_limit < len(cells) else ""
+                        fi_name = cells[col_map["fi"]] if 0 <= col_map["fi"] < len(cells) else ""
+                        facility = cells[col_map["facility"]] if 0 <= col_map["facility"] < len(cells) else ""
+                        limit_val = cells[col_map["limit"]] if 0 <= col_map["limit"] < len(cells) else ""
 
-                        if not limit_val or not re.search(r"[\d,]+", limit_val):
-                            continue
-
-                        if is_lt and not is_st:
-                            outstanding = cells[col_outstanding] if 0 <= col_outstanding < len(cells) else ""
-                            tenure = cells[col_term] if 0 <= col_term < len(cells) else ""
-                            emi = cells[col_emi] if 0 <= col_emi < len(cells) else ""
+                        if classification == "lt":
+                            outstanding = cells[col_map["outstanding"]] if 0 <= col_map["outstanding"] < len(cells) else ""
+                            tenure = cells[col_map["term"]] if 0 <= col_map["term"] < len(cells) else ""
+                            emi = cells[col_map["emi"]] if 0 <= col_map["emi"] < len(cells) else ""
                             lt_results.append({
                                 "bank_name": fi_name,
                                 "facility_type": facility.replace("\n", " "),
@@ -249,9 +299,9 @@ class AppraisalExtractor:
                                 "tenure": tenure,
                                 "repayment_status": "Regular"
                             })
-                        elif is_st:
-                            outstanding = cells[col_outstanding] if 0 <= col_outstanding < len(cells) else ""
-                            recycle = cells[col_recycle] if 0 <= col_recycle < len(cells) else ""
+                        elif classification == "st":
+                            outstanding = cells[col_map["outstanding"]] if 0 <= col_map["outstanding"] < len(cells) else ""
+                            recycle = cells[col_map["recycle"]] if 0 <= col_map["recycle"] < len(cells) else ""
                             st_results.append({
                                 "bank_name": fi_name,
                                 "facility_type": facility.replace("\n", " "),
@@ -262,7 +312,18 @@ class AppraisalExtractor:
                                 "repayment_status": "Regular"
                             })
 
-        return lt_results, st_results
+        # Deduplicate (a continuation table might overlap if pdfplumber detected it twice)
+        def dedup(items):
+            seen = set()
+            unique = []
+            for it in items:
+                key = (it["bank_name"], it.get("facility_type", ""), it["limit"], it["outstanding"])
+                if key not in seen:
+                    seen.add(key)
+                    unique.append(it)
+            return unique
+
+        return dedup(lt_results), dedup(st_results)
 
     def extract_long_term_liabilities(self):
         if not hasattr(self, '_lt_st_cache'):
